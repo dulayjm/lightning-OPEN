@@ -1,0 +1,6 @@
+*.pth
+/train_double_SUN/
+*.rar
+/__pycache__/
+/lightning_logs/
+*.yaml
