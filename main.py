@@ -34,7 +34,7 @@ class Model(LightningModule):
         super(Model, self).__init__()
 
         self.epoch = 0
-        self.learning_rate = 0.001
+        self.learning_rate = 0.015
         self.loss = nn.CrossEntropyLoss()
         self.training_correct_counter = 0
         self.training = False
@@ -107,9 +107,8 @@ class Model(LightningModule):
             ]),
 
 
+# currently same as train 
             'valid': transforms.Compose([
-            #transforms.Resize((512,512),interpolation=2),
-            #transforms.FiveCrop(256),
             transforms.Lambda(lambda img: self.val_crops(img)),
             transforms.Lambda(lambda crops: torch.stack([transforms.Compose([transforms.ToTensor(),
                                                                             transforms.Normalize(mean=[n / 255.
@@ -126,7 +125,6 @@ class Model(LightningModule):
 
         self.trainset = datasets.ImageFolder(train_path, data_transforms['train'])
         self.validset = datasets.ImageFolder(valid_path, data_transforms['valid'])
-        print("self.validset.length", self.validset)
 
 
     def train_dataloader(self):
@@ -136,7 +134,7 @@ class Model(LightningModule):
         return DataLoader(self.validset, batch_size=32, sampler=None, num_workers=4)
     
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        return torch.optim.SGD(self.parameters(), lr=self.learning_rate)
 
     def training_step(self, batch, batch_idx):
         self.training = True
@@ -172,6 +170,11 @@ class Model(LightningModule):
     def validation_epoch_end(self, validation_step_outputs):
         self.training = False
         val_loss = torch.stack([x['val_loss'] for x in validation_step_outputs]).mean()
+        # val_tot = [x['val_acc'] for x in validation_step_outputs]
+        # val_acc = np.mean(val_tot)
+        print("HERE\n\n\n\nValidation in each step\n")
+        print([x['val_acc'] for x in validation_step_outputs])
+
         val_acc = np.mean([x['val_acc'] for x in validation_step_outputs])
         print("val_loss", val_loss)
         print("val_acc", val_acc)
@@ -270,7 +273,7 @@ class Model(LightningModule):
 if __name__ == '__main__':
     trainer = pl.Trainer(
         max_epochs=25,
-        num_sanity_val_steps=-1,
+        num_sanity_val_steps=2,
         gpus=[2] if torch.cuda.is_available() else None
     ) 
 
@@ -278,13 +281,13 @@ if __name__ == '__main__':
     ct=0
     for child in model_ft.model1.children():
         ct += 1
-        if ct < 6: # change to lower numbers for training more layers
+        if ct < 8: # freezing the first few layers to prevent overfitting
             for param in child.parameters():
                 param.requires_grad = False
     ct=0
     for child in model_ft.model2.children():
         ct += 1
-        if ct < 6:
+        if ct < 8:
             for param in child.parameters():
                 param.requires_grad = False
 
