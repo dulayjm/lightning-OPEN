@@ -5,10 +5,13 @@ import gc
 import os
 import numpy as np
 import optuna
+# import matplotlib.pyplot as plt
 from PIL import Image
 from pytorch_metric_learning import losses, samplers
 import pytorch_lightning as pl
 from pytorch_lightning.core.lightning import LightningModule
+from pytorch_lightning import Callback
+from pytorch_lightning import loggers as pl_loggers
 from random import sample, random
 import torch
 from torch import nn
@@ -22,13 +25,21 @@ from torch.utils.data import random_split, Dataset
 
 train_path = '/lab/vislab/OPEN/datasets_RGB_one/train/'
 valid_path = '/lab/vislab/OPEN/datasets_RGB_one/val/'
+
 num_classes = 100
+
+class MetricCallback(Callback):
+    def __init__(self):
+        super().__init__()
+        self.metrics = []
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        self.metrics.append(trainer.callback_metrics)
 
 
 class Model(LightningModule):
     """ Model 
     """
-    #TODO: it might be wise to implement specific __getitem__ functions or something similar to that
 
     def __init__(self, **kwargs):
         super(Model, self).__init__()
@@ -128,40 +139,82 @@ class Model(LightningModule):
 
 
     def train_dataloader(self):
-        return DataLoader(self.trainset, batch_size=32, sampler=None, num_workers=4)
+        return DataLoader(self.trainset, batch_size=32, shuffle=True, sampler=None, num_workers=32)
 
     def val_dataloader(self):
-        return DataLoader(self.validset, batch_size=32, sampler=None, num_workers=4)
+        return DataLoader(self.validset, batch_size=32, shuffle=True, sampler=None, num_workers=32)
     
     def configure_optimizers(self):
         return torch.optim.SGD(self.parameters(), lr=self.learning_rate)
 
     def training_step(self, batch, batch_idx):
-        self.training = True
-        inputs, labels = batch
-        outputs = self(inputs)
-        loss = self.loss(outputs, labels)
+        self.model1.train()
+        self.model2.train()
+        
+        # for imgs, labels in model_ft.trainset: 
+        #     print(labels)
 
-        return {'loss': loss}
-    
-    def training_epoch_end(self, training_step_outputs):
         self.training = True
-        train_loss = torch.stack([x['loss'] for x in training_step_outputs]).mean()
-        return {
-            'log': {'train_loss': train_loss},
-            'progress_bar': {'train_loss': train_loss}
-        }
-
-    def validation_step(self, batch, batch_idx):
-        self.training = False
         inputs, labels = batch
         outputs = self(inputs)
         loss = self.loss(outputs, labels)
 
         labels_hat = torch.argmax(outputs, dim=1)
-        val_acc = torch.sum(labels == labels_hat).item() / (len(labels) * 1.0)
+        train_acc = torch.sum(labels.data == labels_hat).item() / (len(labels) * 1.0)
+
+        self.model1.eval()
+        self.model2.eval()
+
+        return {
+            'loss': loss,
+            'train_acc': train_acc
+        }
+    
+    def training_epoch_end(self, training_step_outputs):
+        self.training = True
+        self.model1.train()
+        self.model2.train()
+
+        train_acc = np.mean([x['train_acc'] for x in training_step_outputs])
+        train_acc = torch.tensor(train_acc, dtype=torch.float32)
+        print("train_acc", train_acc)
+        train_loss = torch.stack([x['loss'] for x in training_step_outputs]).mean()
+        
+        # self.logger.experiment.add_scalar("Loss/Train", avg_loss, self.epoch)
+        self.model1.eval()
+        self.model2.eval()
+
+        return {
+            'log': {
+                'train_loss': train_loss,
+                'train_acc': train_acc
+                },
+            'progress_bar': {
+                'train_loss': train_loss,
+                'train_acc': train_acc
+            }
+        }
+    
+
+    def validation_step(self, batch, batch_idx):
+        self.training = False
+        self.model1.eval()
+        self.model2.eval()
+
+        inputs, labels = batch
+        outputs = self(inputs)
+        loss = self.loss(outputs, labels)
 
 
+        # _, preds = torch.max(outputs, 1)
+        # running_corrects += torch.sum(preds == labels.data)
+
+        labels_hat = torch.argmax(outputs, dim=1)
+        # print("labels", labels,"labels_hat",labels_hat)
+        val_acc = torch.sum(labels.data == labels_hat).item() / (len(labels) * 1.0)
+
+        self.model1.train()
+        self.model2.train()
         return {
             'val_loss': loss,
             'val_acc': val_acc
@@ -169,6 +222,9 @@ class Model(LightningModule):
     
     def validation_epoch_end(self, validation_step_outputs):
         self.training = False
+        self.model1.eval()
+        self.model2.eval()
+
         val_loss = torch.stack([x['val_loss'] for x in validation_step_outputs]).mean()
         # val_tot = [x['val_acc'] for x in validation_step_outputs]
         # val_acc = np.mean(val_tot)
@@ -176,10 +232,13 @@ class Model(LightningModule):
         print([x['val_acc'] for x in validation_step_outputs])
 
         val_acc = np.mean([x['val_acc'] for x in validation_step_outputs])
+        val_acc = torch.tensor(val_acc, dtype=torch.float32)
         print("val_loss", val_loss)
         print("val_acc", val_acc)
 
         self.epoch += 1
+        self.model1.train()
+        self.model2.train()
         return {
             'log': {
                 'val_loss': val_loss,
@@ -271,23 +330,27 @@ class Model(LightningModule):
 
 
 if __name__ == '__main__':
+    metrics_callback = MetricCallback()
+    logger = pl_loggers.TensorBoardLogger('/lab/vislab/OPEN/justin/lightning-OPEN/logs/layer_4/')
     trainer = pl.Trainer(
         max_epochs=25,
-        num_sanity_val_steps=2,
-        gpus=[2] if torch.cuda.is_available() else None
+        num_sanity_val_steps=-1,
+        gpus=[2] if torch.cuda.is_available() else None,
+        callbacks=[metrics_callback],
+        logger=logger
     ) 
 
     model_ft = Model()
     ct=0
     for child in model_ft.model1.children():
         ct += 1
-        if ct < 8: # freezing the first few layers to prevent overfitting
+        if ct < 4: # freezing the first few layers to prevent overfitting
             for param in child.parameters():
                 param.requires_grad = False
     ct=0
     for child in model_ft.model2.children():
         ct += 1
-        if ct < 8:
+        if ct < 4:
             for param in child.parameters():
                 param.requires_grad = False
 
