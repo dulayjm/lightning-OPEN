@@ -4,3 +4,10 @@
 /__pycache__/
 /lightning_logs/
 *.yaml
+*.png
+nohup.out
+/yoked/
+/ori/
+/lightning_logs/
+/lightning_one_MIT/
+/iNat_logs/
