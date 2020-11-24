@@ -3,8 +3,9 @@ from __future__ import absolute_import
 import neptune
 
 neptune.init('dulayjm/sandbox')
-neptune.create_experiment(name='plants_only_imagefolder', params={'lr': 0.0045}, tags=['resnet', 'iNat'])
+neptune.create_experiment(name='plants_antialiasing', params={'lr': 0.015}, tags=['resnet152', 'iNat'])
 
+import antialiased_cnns
 from argparse import ArgumentParser
 import gc
 import os
@@ -29,10 +30,6 @@ from torch.utils.data import DataLoader, random_split
 import torchvision
 from torchvision import datasets, transforms, models
 from torch.utils.data import random_split, Dataset
-
-
-# train_path = '/lab/vislab/OPEN/datasets_RGB_one/train/'
-# valid_path = '/lab/vislab/OPEN/datasets_RGB_one/val/'
 
 
 class MetricCallback(Callback):
@@ -61,7 +58,7 @@ def ccop(conv_feats, threshold, bs, ncrops=1,pooling='ccop'):
         
         conv_feats = conv_feats.reshape(bs, nf, ncrops, h, w).transpose(1, 2)
         # take the average of the non-nan values
-        conv_feats=torch.sum(torch.where(torch.isnan(conv_feats),torch.tensor(0.).to("cuda:2"),conv_feats),[3,4])/(torch.sum((~torch.isnan(conv_feats)),[3,4])+0.001)
+        conv_feats=torch.sum(torch.where(torch.isnan(conv_feats),torch.tensor(0.).to("cuda:3"),conv_feats),[3,4])/(torch.sum((~torch.isnan(conv_feats)),[3,4])+0.001)
 
         # average over the 64 crops
         conv_feats = conv_feats.view(bs, ncrops, -1)
@@ -76,16 +73,17 @@ class Model(LightningModule):
         super(Model, self).__init__()
 
         self.epoch = 0
+        self.log = True
         self.learning_rate = 0.015
-        self.batch_size=16
+        self.batch_size=12
         self.dropout_rate = 0
         self.pooling = 'ccop'
+        self.num_classes = 682
         # self.dataset = 'OPEN_small'
-        self.multi_network = True
+        self.multi_network = False
 
         # self.train_path = data[self.dataset]['train_path']
         # self.valid_path = data[self.dataset]['val_path']
-        self.num_classes = 682
         # self.means = data[self.dataset]['mean']
         # self.stds = data[self.dataset]['std']
         
@@ -97,7 +95,7 @@ class Model(LightningModule):
         self.std_thresh = 3
         self.std_thresh2 = 0.5
                 
-        mod1 = models.resnet50(pretrained=True)
+        mod1 = antialiased_cnns.resnet50(pretrained=True, filter_size=4)
         self.model1 = nn.Sequential(
             mod1.conv1,
             mod1.bn1,
@@ -110,7 +108,7 @@ class Model(LightningModule):
             mod1.layer4,
         )
         if self.multi_network:
-            mod2 = models.resnet50(pretrained=True)
+            mod2 = antialiased_cnns.resnet50(pretrained=True, filter_size=4)
             self.model2 = nn.Sequential(
                 mod2.conv1,
                 mod2.bn1,
@@ -123,7 +121,9 @@ class Model(LightningModule):
                 mod2.layer4,
             )
         self.fc = nn.Linear(4096, self.num_classes)
-    
+        # self.fc1 = nn.Linear(4096,512)
+        # self.fc2 = nn.Linear(512,self.num_classes)    
+
     def forward(self, x):
         x = x.transpose(1, 0)
         
@@ -163,15 +163,26 @@ class Model(LightningModule):
             x = F.dropout(x, self.dropout_rate) # we might want to play around w this value
         
         return self.fc(x.view(x.size(0), -1))
+        # fc1 = self.fc1(x.view(x.size(0), -1))
+        # fc2 = self.fc2(fc1)
+        # s = nn.Sigmoid()
+        # output = s(fc2)
+        # return output
     
     def train(self):
         self.model1.train()
-        self.model2.train()
+        # self.model2.train()
         self.fc.train()
+        # self.fc1.train()
+        # self.fc2.train()
+
     def eval(self):
         self.model1.eval()
-        self.model2.eval()
-        self.fc.eval()
+        # self.model2.eval()
+        self.fc.train()
+        # self.fc1.eval()
+        # self.fc2.eval()
+
 
     def prepare_data(self):
         data_transforms = {
@@ -212,23 +223,24 @@ class Model(LightningModule):
         }   
 
         # just plants here: 
-        data_dir = '/lab/vislab/OPEN/iNaturalist/train_val2019/Plants/'
+        data_dir = '/lab/vislab/OPEN/iNaturalist/train_val2019/Plants'
 
         master_dataset = datasets.ImageFolder(
             data_dir, data_transforms['train'],
         )
 
-        print("HERE")
-        print(len(master_dataset))
-        print(len(master_dataset)*.8)
+        # print("HERE")
+        # print(len(master_dataset))
+        # print(len(master_dataset)*.8)
 
         self.trainset, self.validset = torch.utils.data.random_split(master_dataset, (126770,31693))
+        # self.trainset, self.validset = torch.utils.data.random_split(master_dataset, (2102,526))
 
     def train_dataloader(self):
-        return DataLoader(self.trainset, batch_size=25, shuffle=False, num_workers=25)
+        return DataLoader(self.trainset, batch_size=self.batch_size, shuffle=False, num_workers=self.batch_size)
 
     def val_dataloader(self):
-        return DataLoader(self.validset, batch_size=25, shuffle=False, num_workers=25)
+        return DataLoader(self.validset, batch_size=self.batch_size, shuffle=False, num_workers=self.batch_size)
     
     def configure_optimizers(self):
         return torch.optim.SGD(self.parameters(), lr=self.learning_rate)
@@ -242,7 +254,7 @@ class Model(LightningModule):
         self.training = True
         inputs, labels = batch
         outputs = self(inputs)
-        loss = self.loss(outputs, labels)
+       loss = self.loss(outputs, labels)
 
         labels_hat = torch.argmax(outputs, dim=1)
         train_acc = torch.sum(labels.data == labels_hat).item() / (len(labels) * 1.0)
@@ -262,12 +274,15 @@ class Model(LightningModule):
         train_acc = torch.tensor(train_acc, dtype=torch.float32)
         print("train_acc", train_acc)
         train_loss = torch.stack([x['loss'] for x in training_step_outputs]).mean()
-        neptune.log_metric('train_loss', train_loss)
-        neptune.log_metric('train acc', train_acc)
+
+        if self.log:
+            neptune.log_metric('train_loss', train_loss)
+            neptune.log_metric('train acc', train_acc)
 
         # self.logger.experiment.add_scalar("Loss/Train", avg_loss, self.epoch)
+        torch.cuda.empty_cache()
         self.eval()
-
+    
         return {
             'log': {
                 'train_loss': train_loss,
@@ -318,8 +333,9 @@ class Model(LightningModule):
         print("val_loss", val_loss)
         print("val_acc", val_acc)
 
-        neptune.log_metric('val_loss', val_loss)
-        neptune.log_metric('val acc', val_acc)
+        if self.log: 
+            neptune.log_metric('val_loss', val_loss)
+            neptune.log_metric('val acc', val_acc)
 
 
         self.epoch += 1
@@ -429,7 +445,7 @@ if __name__ == '__main__':
     trainer = pl.Trainer(
         max_epochs=25,
         num_sanity_val_steps=2,
-        gpus=[2] if torch.cuda.is_available() else None,
+        gpus=[3] if torch.cuda.is_available() else None,
         callbacks=[metrics_callback],
         # logger=logger
     ) 
@@ -438,15 +454,15 @@ if __name__ == '__main__':
     ct=0
     for child in model_ft.model1.children():
         ct += 1
-        if ct < 8: # freezing the first few layers to prevent overfitting
+        if ct < 5: # freezing the first few layers to prevent overfitting
             for param in child.parameters():
                 param.requires_grad = False
-    ct=0
-    for child in model_ft.model2.children():
-        ct += 1
-        if ct < 8: 
-            for param in child.parameters():
-                param.requires_grad = False
+    # ct=0
+    # for child in model_ft.model2.children():
+    #     ct += 1
+    #     if ct < 8: 
+    #         for param in child.parameters():
+    #             param.requires_grad = False
 
 
     trainer.fit(model_ft)

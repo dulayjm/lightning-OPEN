@@ -260,6 +260,31 @@ class INAT(torch.utils.data.Dataset):
         return len(self.imgs)
 ###############################################################
 
+def ccop(conv_feats, threshold, bs, ncrops=1,pooling='ccop'):
+    _, nf, h, w = conv_feats.size()
+    conv_feats = conv_feats.view(bs, ncrops, nf, h, w).transpose(1, 2)
+    
+    if pooling.lower()=='avg':
+        conv_feats = torch.mean(conv_feats,[2,3,4])
+    
+    elif pooling.lower()=='max':
+        conv_feats = conv_feats.reshape(bs,nf,ncrops*h*w)
+        conv_feats = torch.max(conv_feats,-1)[0]
+    
+    else:
+        conv_feats = conv_feats.reshape(bs*nf, ncrops * h * w).transpose(0,1)
+        conv_feats = torch.where(conv_feats >= torch.mean(conv_feats, 0) + threshold * torch.std(conv_feats, 0), conv_feats, torch.cuda.FloatTensor([float("nan")])).transpose(0,1)
+        
+        conv_feats = conv_feats.reshape(bs, nf, ncrops, h, w).transpose(1, 2)
+        # take the average of the non-nan values
+        conv_feats=torch.sum(torch.where(torch.isnan(conv_feats),torch.tensor(0.).to("cuda:2"),conv_feats),[3,4])/(torch.sum((~torch.isnan(conv_feats)),[3,4])+0.001)
+
+        # average over the 64 crops
+        conv_feats = conv_feats.view(bs, ncrops, -1)
+        conv_feats = torch.mean(conv_feats, 1)
+    
+    return conv_feats
+
 class Model(LightningModule):
     """ Model
     """
@@ -268,14 +293,28 @@ class Model(LightningModule):
         super(Model, self).__init__()
 
         self.epoch = 0
-        self.learning_rate = 0.0045
+        self.learning_rate = 0.015
+        self.batch_size=16
+        self.dropout_rate = 0
+        self.pooling = 'ccop'
+        # self.dataset = 'OPEN_small'
+        self.multi_network = True
+
+        # self.train_path = data[self.dataset]['train_path']
+        # self.valid_path = data[self.dataset]['val_path']
+        self.num_classes = 1010
+        # self.means = data[self.dataset]['mean']
+        # self.stds = data[self.dataset]['std']
+        
         self.training_correct_counter = 0
         self.training = False
-        self.batch_size=16
+        
         self.loss=nn.CrossEntropyLoss()
-
+        
+        self.std_thresh = 3
+        self.std_thresh2 = 0.5
+                
         mod1 = models.resnet50(pretrained=True)
-        #mod2 = models.resnet50(pretrained=True)
         self.model1 = nn.Sequential(
             mod1.conv1,
             mod1.bn1,
@@ -287,71 +326,150 @@ class Model(LightningModule):
             mod1.layer3,
             mod1.layer4,
         )
-        """self.model2 = nn.Sequential(
-            mod2.conv1,
-            mod2.bn1,
-            mod2.relu,
-            mod2.maxpool,
+        if self.multi_network:
+            mod2 = models.resnet50(pretrained=True)
+            self.model2 = nn.Sequential(
+                mod2.conv1,
+                mod2.bn1,
+                mod2.relu,
+                mod2.maxpool,
 
-            mod2.layer1,
-            mod2.layer2,
-            mod2.layer3,
-            mod2.layer4,
-        )"""
-        self.fc = nn.Linear(4096, num_classes)
+                mod2.layer1,
+                mod2.layer2,
+                mod2.layer3,
+                mod2.layer4,
+            )
+        self.fc = nn.Linear(4096, self.num_classes)
+    
     def forward(self, x):
         x = x.transpose(1, 0)
-        #nc,_,_,_,_=x.size()
-        x0 = x[:-4].transpose(1,0)
-        x1 = x[-4:].transpose(1,0)
+        
+        x0 = x[:-4].transpose(1,0) # high resolution crops
+        x1 = x[-4:].transpose(1,0) # low resolution crops
+                
+        # high res
         bs, ncrops, c, h, w = x0.size()
-        #bs,c, h, w = x0.size()
         x0 = x0.contiguous().view((-1, c, h, w))
         x0 = self.model1(x0)
-        #x0 = F.avg_pool2d(x0, 8)
-        _, nf, h, w = x0.size()
-        x0 = x0.view(bs, ncrops, nf, h, w).transpose(1, 2).reshape(bs * nf, ncrops * h * w).transpose(0, 1)
-        x0 = torch.where(x0 >= torch.mean(x0, 0) + 4 * torch.std(x0, 0), x0, torch.tensor(float("nan")).to("cuda:2")).transpose(0,1)
-        x0 = x0.reshape(bs, nf, ncrops, h, w).transpose(1, 2)
-        x0=torch.sum(torch.where(torch.isnan(x0),torch.tensor(0.).to("cuda:2"),x0),[3,4])/(torch.sum((~torch.isnan(x0)),[3,4])+0.001)
-        #x0 = F.avg_pool2d(x0.reshape(bs * ncrops, nf, h, w), 8)
-        x0 = x0.view(bs, ncrops, -1)
-        x0 = torch.mean(x0, 1)
-        #x0 = x0.view(bs, -1)
-        #x0, _ = torch.max(x0.view(bs, ncrops, -1), 1)
-        #x0 = torch.stack([torch.sum(ax * F.softmax(ax, 0), 0) for ax in x0])
+        if self.pooling.lower() == 'ccop':
+            x0 = ccop(x0, self.std_thresh, bs, ncrops)
+        elif self.pooling.lower() == 'max':
+            x0 = ccop(x0, self.std_thresh, bs, ncrops,pooling='max')
+        else:
+            x0 = ccop(x0, self.std_thresh, bs, ncrops,pooling='avg')
+        
+        # low res
         bs, ncrops, c, h, w = x1.size()
-        #bs, c, h, w = x1.size()
         x1 = x1.contiguous().view((-1, c, h, w))
-        x1 = self.model1(x1)
-        x1 = F.avg_pool2d(x1, 8)
-        #x1= x1.view(bs,ncrops,-1)
-        #x1 = torch.stack([torch.where(ax > torch.mean(ax,0) + 1, ax, torch.tensor(0.).to("cuda:0")) for ax in x1])
-        #x1 = torch.stack([torch.sum(ax, 0) / (torch.sum((ax != 0.), 0) + 1) for ax in x1])
-        #x1 = torch.stack([torch.sum(ax * F.softmax(ax, 0), 0) for ax in x1])
-        #x1= x1.view(bs,-1)
-        #x1, _ = torch.max(x1, 1)
-        _, nf, h, w = x1.size()
-        x1 = x1.view(bs, ncrops, nf, h, w).transpose(1, 2).reshape(bs * nf, ncrops * h * w).transpose(0, 1)
-        x1 = torch.where(x1 >= torch.mean(x1, 0) + 1 * torch.std(x1, 0), x1,
-                         torch.tensor(float("nan")).to("cuda:2")).transpose(0, 1)
-        x1 = x1.reshape(bs, nf, ncrops, h, w).transpose(1, 2)
-        x1 = torch.sum(torch.where(torch.isnan(x1), torch.tensor(0.).to("cuda:2"), x1), [3, 4]) / (
-                    torch.sum((~torch.isnan(x1)), [3, 4]) + 0.001)
-        # x0 = F.avg_pool2d(x0.reshape(bs * ncrops, nf, h, w), 8)
-        x1 = x1.view(bs, ncrops, -1)
-        x1 = torch.mean(x1, 1)
+        if self.multi_network:
+            x1 = self.model2(x1)
+        else:
+            x1 = self.model1(x1)
+        
+        if self.pooling.lower() == 'ccop':
+            x1 = ccop(x1, self.std_thresh2, bs, ncrops)
+        elif self.pooling.lower() == 'max':
+            x1 = ccop(x1, self.std_thresh2, bs, ncrops,pooling='max')
+        else:
+            x1 = ccop(x1, self.std_thresh2, bs, ncrops,pooling='avg')
+        
         x = torch.cat([x0, x1], 1)
+        x[torch.isnan(x)] = 0.
+        
         if self.training == True:
-            x = F.dropout(x, 0.3)
+            x = F.dropout(x, self.dropout_rate) # we might want to play around w this value
+        
         return self.fc(x.view(x.size(0), -1))
+
+
+    # def __init__(self, **kwargs):
+    #     super(Model, self).__init__()
+
+    #     self.epoch = 0
+    #     self.learning_rate = 0.0045
+    #     self.training_correct_counter = 0
+    #     self.training = False
+    #     self.batch_size=16
+    #     self.loss=nn.CrossEntropyLoss()
+
+    #     mod1 = models.resnet50(pretrained=True)
+    #     #mod2 = models.resnet50(pretrained=True)
+    #     self.model1 = nn.Sequential(
+    #         mod1.conv1,
+    #         mod1.bn1,
+    #         mod1.relu,
+    #         mod1.maxpool,
+
+    #         mod1.layer1,
+    #         mod1.layer2,
+    #         mod1.layer3,
+    #         mod1.layer4,
+    #     )
+    #     """self.model2 = nn.Sequential(
+    #         mod2.conv1,
+    #         mod2.bn1,
+    #         mod2.relu,
+    #         mod2.maxpool,
+
+    #         mod2.layer1,
+    #         mod2.layer2,
+    #         mod2.layer3,
+    #         mod2.layer4,
+    #     )"""
+    #     self.fc = nn.Linear(4096, num_classes)
+    # def forward(self, x):
+    #     x = x.transpose(1, 0)
+    #     #nc,_,_,_,_=x.size()
+    #     x0 = x[:-4].transpose(1,0)
+    #     x1 = x[-4:].transpose(1,0)
+    #     bs, ncrops, c, h, w = x0.size()
+    #     #bs,c, h, w = x0.size()
+    #     x0 = x0.contiguous().view((-1, c, h, w))
+    #     x0 = self.model1(x0)
+    #     #x0 = F.avg_pool2d(x0, 8)
+    #     _, nf, h, w = x0.size()
+    #     x0 = x0.view(bs, ncrops, nf, h, w).transpose(1, 2).reshape(bs * nf, ncrops * h * w).transpose(0, 1)
+    #     x0 = torch.where(x0 >= torch.mean(x0, 0) + 4 * torch.std(x0, 0), x0, torch.tensor(float("nan")).to("cuda:2")).transpose(0,1)
+    #     x0 = x0.reshape(bs, nf, ncrops, h, w).transpose(1, 2)
+    #     x0=torch.sum(torch.where(torch.isnan(x0),torch.tensor(0.).to("cuda:2"),x0),[3,4])/(torch.sum((~torch.isnan(x0)),[3,4])+0.001)
+    #     #x0 = F.avg_pool2d(x0.reshape(bs * ncrops, nf, h, w), 8)
+    #     x0 = x0.view(bs, ncrops, -1)
+    #     x0 = torch.mean(x0, 1)
+    #     #x0 = x0.view(bs, -1)
+    #     #x0, _ = torch.max(x0.view(bs, ncrops, -1), 1)
+    #     #x0 = torch.stack([torch.sum(ax * F.softmax(ax, 0), 0) for ax in x0])
+    #     bs, ncrops, c, h, w = x1.size()
+    #     #bs, c, h, w = x1.size()
+    #     x1 = x1.contiguous().view((-1, c, h, w))
+    #     x1 = self.model1(x1)
+    #     x1 = F.avg_pool2d(x1, 8)
+    #     #x1= x1.view(bs,ncrops,-1)
+    #     #x1 = torch.stack([torch.where(ax > torch.mean(ax,0) + 1, ax, torch.tensor(0.).to("cuda:0")) for ax in x1])
+    #     #x1 = torch.stack([torch.sum(ax, 0) / (torch.sum((ax != 0.), 0) + 1) for ax in x1])
+    #     #x1 = torch.stack([torch.sum(ax * F.softmax(ax, 0), 0) for ax in x1])
+    #     #x1= x1.view(bs,-1)
+    #     #x1, _ = torch.max(x1, 1)
+    #     _, nf, h, w = x1.size()
+    #     x1 = x1.view(bs, ncrops, nf, h, w).transpose(1, 2).reshape(bs * nf, ncrops * h * w).transpose(0, 1)
+    #     x1 = torch.where(x1 >= torch.mean(x1, 0) + 1 * torch.std(x1, 0), x1,
+    #                      torch.tensor(float("nan")).to("cuda:2")).transpose(0, 1)
+    #     x1 = x1.reshape(bs, nf, ncrops, h, w).transpose(1, 2)
+    #     x1 = torch.sum(torch.where(torch.isnan(x1), torch.tensor(0.).to("cuda:2"), x1), [3, 4]) / (
+    #                 torch.sum((~torch.isnan(x1)), [3, 4]) + 0.001)
+    #     # x0 = F.avg_pool2d(x0.reshape(bs * ncrops, nf, h, w), 8)
+    #     x1 = x1.view(bs, ncrops, -1)
+    #     x1 = torch.mean(x1, 1)
+    #     x = torch.cat([x0, x1], 1)
+    #     if self.training == True:
+    #         x = F.dropout(x, 0.3)
+    #     return self.fc(x.view(x.size(0), -1))
     def train(self):
         self.model1.train()
-        #self.model2.train()
+        self.model2.train()
         self.fc.train()
     def eval(self):
         self.model1.eval()
-        #self.model2.eval()
+        self.model2.eval()
         self.fc.eval()
 
         
