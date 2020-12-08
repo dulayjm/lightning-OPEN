@@ -21,6 +21,8 @@ from pytorch_lightning.core.lightning import LightningModule
 from pytorch_lightning import Callback
 from pytorch_lightning import loggers as pl_loggers
 from random import sample, random
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 from torch.utils.data.sampler import SubsetRandomSampler
 import torch
 from torch import nn
@@ -39,6 +41,47 @@ class MetricCallback(Callback):
 
     def on_validation_epoch_end(self, trainer, pl_module):
         self.metrics.append(trainer.callback_metrics)
+
+
+# let's do some tsne first 
+def map_features(outputs, labels, out_file):
+    # create array of column for each feature output
+    feat_cols = ['feature'+str(i) for i in range(outputs.shape[1])]
+    
+    # make dataframe of outputs -> labels
+    df = pd.DataFrame(outputs, columns=feat_cols)
+    df['y'] = labels
+    df['labels'] = df['y'].apply(lambda i: str(i))
+    
+    # clear outputs and labels
+    outputs, labels = None, None
+    
+    # creates an array of random indices from size of outputs
+    np.random.seed(42)
+    rndperm = np.random.permutation(df.shape[0])
+    
+    num_examples = 10000
+    
+    df_subset = df.loc[rndperm[:num_examples],:].copy()
+    data_subset = df_subset[feat_cols].values
+    
+    pca = PCA(n_components=50)
+    pca_result = pca.fit_transform(data_subset)
+    
+    tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300)
+    tsne_results = tsne.fit_transform(data_subset)
+    df_subset['tsne-2d-one'] = tsne_results[:,0]
+    df_subset['tsne-2d-two'] = tsne_results[:,1]
+    
+    plt.figure(figsize=(16,10))
+    plt.scatter(
+        x=df_subset["tsne-2d-one"],
+        y=df_subset["tsne-2d-two"],
+        c=df_subset["y"]
+    )
+    plt.savefig(out_file, bbox_inches='tight', pad_inches = 0)
+    plt.close()
+
 
 
 def ccop(conv_feats, threshold, bs, ncrops=1,pooling='ccop'):
@@ -77,7 +120,6 @@ class Model(LightningModule):
         self.learning_rate = 0.015
         self.batch_size=10
         self.dropout_rate = 0
-        self.pooling = 'ccop'
         self.num_classes = 10
         # self.dataset = 'OPEN_small'
         self.multi_network = False
@@ -88,15 +130,16 @@ class Model(LightningModule):
         # self.stds = data[self.dataset]['std']
         
         self.training_correct_counter = 0
-        self.training = False
         
         self.loss=nn.CrossEntropyLoss()
         
         self.std_thresh = 2
         self.std_thresh2 = 0.5
                 
+
         mod1 = antialiased_cnns.resnet50(pretrained=True, filter_size=4)
-        self.model1 = nn.Sequential(
+        # model arch 
+        self.trunk = nn.Sequential(
             mod1.conv1,
             mod1.bn1,
             mod1.relu,
@@ -107,79 +150,78 @@ class Model(LightningModule):
             mod1.layer3,
             mod1.layer4,
         )
-        if self.multi_network:
-            mod2 = antialiased_cnns.resnet50(pretrained=True, filter_size=4)
-            self.model2 = nn.Sequential(
-                mod2.conv1,
-                mod2.bn1,
-                mod2.relu,
-                mod2.maxpool,
+        self.embedder = nn.Linear(2048, 10) # or 256?
+        self.training=True
+        self.running_outputs = np.array([])
+        self.running_labels = np.array([])
 
-                mod2.layer1,
-                mod2.layer2,
-                mod2.layer3,
-                mod2.layer4,
-            )
-        self.fc = nn.Linear(4096, self.num_classes)
-        # self.fc1 = nn.Linear(4096,512)
-        # self.fc2 = nn.Linear(512,self.num_classes)    
+    # forward 
+    def forward(self, x, pooling="ccop", images="notsinglelolz, im taken"):
+        if images=="single":
+            bs, c, h, w = x.size()
+        else:
+            bs, ncrops, c, h, w = x.size()
+            x = x.contiguous().view((-1, c, h, w))
+        x = self.trunk(x)
 
-    def forward(self, x):
-        x = x.transpose(1, 0)
-        
-        x0 = x[:-4].transpose(1,0) # high resolution crops
-        x1 = x[-4:].transpose(1,0) # low resolution crops
-                
-        # high res
-        bs, ncrops, c, h, w = x0.size()
-        x0 = x0.contiguous().view((-1, c, h, w))
-        x0 = self.model1(x0)
-        if self.pooling.lower() == 'ccop':
-            x0 = ccop(x0, self.std_thresh, bs, ncrops)
-        elif self.pooling.lower() == 'max':
-            x0 = ccop(x0, self.std_thresh, bs, ncrops,pooling='max')
+        if images=="single":
+            x = self.pooling_single(x, self.std_thresh, bs, pooling)
         else:
-            x0 = ccop(x0, self.std_thresh, bs, ncrops,pooling='avg')
-        
-        # low res
-        bs, ncrops, c, h, w = x1.size()
-        x1 = x1.contiguous().view((-1, c, h, w))
-        if self.multi_network:
-            x1 = self.model2(x1)
-        else:
-            x1 = self.model1(x1)
-        
-        if self.pooling.lower() == 'ccop':
-            x1 = ccop(x1, self.std_thresh2, bs, ncrops)
-        elif self.pooling.lower() == 'max':
-            x1 = ccop(x1, self.std_thresh2, bs, ncrops,pooling='max')
-        else:
-            x1 = ccop(x1, self.std_thresh2, bs, ncrops,pooling='avg')
-        
-        x = torch.cat([x0, x1], 1)
+            x = self.pooling(x, self.std_thresh, bs, ncrops)
+
         x[torch.isnan(x)] = 0.
-        
+
         if self.training == True:
-            x = F.dropout(x, self.dropout_rate) # we might want to play around w this value
+            x = F.dropout(x, self.dropout_rate)
+
+        self.running_outputs = np.concatenate((self.running_outputs, x.cpu().detach().numpy()))
+        return self.embedder(x.view(x.size(0), -1))
+
+    def pooling(self, conv_feats, threshold, bs, ncrops=1):
+        _, nf, h, w = conv_feats.size()
+        conv_feats = conv_feats.view(bs, ncrops, nf, h, w).transpose(1, 2)
+
+        conv_feats = conv_feats.reshape(bs*nf, ncrops * h * w).transpose(0,1)
+        conv_feats = torch.where(conv_feats >= torch.mean(conv_feats, 0) + threshold * torch.std(conv_feats, 0), conv_feats, torch.cuda.FloatTensor([float("nan")])).transpose(0,1)
+        conv_feats = conv_feats.reshape(bs, nf, ncrops, h, w).transpose(1, 2)
         
-        return self.fc(x.view(x.size(0), -1))
-        # fc1 = self.fc1(x.view(x.size(0), -1))
-        # fc2 = self.fc2(fc1)
-        # s = nn.Sigmoid()
-        # output = s(fc2)
-        # return output
+        # take the average of the non-nan values
+        conv_feats=torch.sum(torch.where(torch.isnan(conv_feats),torch.cuda.FloatTensor([0.]),conv_feats),[3,4])/(torch.sum((~torch.isnan(conv_feats)),[3,4])+0.001)
+
+        # average over the 64 crops
+        conv_feats = conv_feats.view(bs, ncrops, -1)
+        conv_feats = torch.mean(conv_feats, 1)
+        return conv_feats
     
+    def pooling_single(self, conv_feats, threshold, bs, pooling='ccop'):
+        _, nf, h, w = conv_feats.size()
+
+        if pooling.lower()=='avg':
+            conv_feats = torch.mean(conv_feats,[2,3])
+
+        elif pooling.lower()=='max':
+            conv_feats = conv_feats.reshape(bs,nf,h*w)
+            conv_feats = torch.max(conv_feats,-1)[0]
+
+        else:
+            conv_feats = conv_feats.reshape(bs*nf, h * w).transpose(0,1)
+            conv_feats = torch.where(conv_feats >= torch.mean(conv_feats, 0) + threshold * torch.std(conv_feats, 0), conv_feats, torch.cuda.FloatTensor([float("nan")])).transpose(0,1)
+            conv_feats = conv_feats.reshape(bs, nf, h, w)
+            # take the average of the non-nan values
+            conv_feats = torch.sum(torch.where(torch.isnan(conv_feats),torch.cuda.FloatTensor([0.]),conv_feats),[2,3])/(torch.sum((~torch.isnan(conv_feats)),[2,3])+0.001)
+        return conv_feats
+
     def train(self):
-        self.model1.train()
+        self.trunk.train()
         # self.model2.train()
-        self.fc.train()
+        self.embedder.train()
         # self.fc1.train()
         # self.fc2.train()
 
     def eval(self):
-        self.model1.eval()
+        self.trunk.eval()
         # self.model2.eval()
-        self.fc.train()
+        self.embedder.train()
         # self.fc1.eval()
         # self.fc2.eval()
 
@@ -260,7 +302,7 @@ class Model(LightningModule):
 
         self.training = True
         inputs, labels = batch
-        outputs = self(inputs)
+        outputs = self(inputs, pooling='ccop')
         loss = self.loss(outputs, labels)
 
         labels_hat = torch.argmax(outputs, dim=1)
@@ -307,7 +349,7 @@ class Model(LightningModule):
         self.eval()
 
         inputs, labels = batch
-        outputs = self(inputs)
+        outputs = self(inputs, pooling='ccop')
         loss = self.loss(outputs, labels)
 
 
@@ -318,6 +360,10 @@ class Model(LightningModule):
         # print("labels", labels,"labels_hat",labels_hat)
         val_acc = torch.sum(labels.data == labels_hat).item() / (len(labels) * 1.0)
 
+        # print(outputs.shape)
+        # print(labels.shape)
+
+        self.running_labels = np.concatenate((self.running_labels, labels.cpu().detach().numpy()))
         self.train()
 
         return {
@@ -344,7 +390,12 @@ class Model(LightningModule):
         #     neptune.log_metric('val_loss', val_loss)
         #     neptune.log_metric('val acc', val_acc)
 
+        print(self.running_outputs.shape)
+        print(self.running_labels.shape)
 
+        map_features(self.running_outputs, self.running_labels[0], 'results/{}/map{}'.format("model", self.epoch+1))
+
+        
         self.epoch += 1
         self.train()
 
@@ -459,7 +510,7 @@ if __name__ == '__main__':
 
     model_ft = Model()
     ct=0
-    for child in model_ft.model1.children():
+    for child in model_ft.children():
         ct += 1
         if ct < 5: # freezing the first few layers to prevent overfitting
             for param in child.parameters():

@@ -11,3 +11,5 @@ nohup.out
 /lightning_logs/
 /lightning_one_MIT/
 /iNat_logs/
+/samples/
+*.ipynb
